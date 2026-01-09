@@ -58,12 +58,6 @@ Bool noShapeExtension = FALSE;
 typedef RegionPtr (*CreateDftPtr) (WindowPtr    /* pWin */
     );
 
-static int ShapeFreeClient(void * /* data */ ,
-                           XID    /* id */
-    );
-static int ShapeFreeEvents(void * /* data */ ,
-                           XID    /* id */
-    );
 static void SShapeNotifyEvent(xShapeNotifyEvent * /* from */ ,
                               xShapeNotifyEvent *       /* to */
     );
@@ -73,7 +67,7 @@ static void SShapeNotifyEvent(xShapeNotifyEvent * /* from */ ,
  */
 
 static int ShapeEventBase = 0;
-static RESTYPE ClientType, ShapeEventType;      /* resource types for event masks */
+static DevPrivateKeyRec ShapeClientPrivateKey;
 
 /*
  * each window has a list of clients requesting
@@ -88,8 +82,6 @@ typedef struct _ShapeEvent *ShapeEventPtr;
 typedef struct _ShapeEvent {
     ShapeEventPtr next;
     ClientPtr client;
-    WindowPtr window;
-    XID clientResource;
 } ShapeEventRec;
 
 /****************
@@ -711,46 +703,24 @@ ProcShapeQueryExtents(ClientPtr client)
     return X_SEND_REPLY_SIMPLE(client, reply);
 }
 
- /*ARGSUSED*/ static int
-ShapeFreeClient(void *data, XID id)
-{
-    ShapeEventPtr pShapeEvent;
-    WindowPtr pWin;
-    ShapeEventPtr *pHead, pCur, pPrev;
-    int rc;
+static void ShapeRemoveForClient(ClientPtr pClient) {
+  ShapeEventPtr pHead, pShapeEvent, pShapeEventNext;
 
-    pShapeEvent = (ShapeEventPtr) data;
-    pWin = pShapeEvent->window;
-    rc = dixLookupResourceByType((void **) &pHead, pWin->drawable.id,
-                                 ShapeEventType, serverClient, DixReadAccess);
-    if (rc == Success) {
-        pPrev = 0;
-        for (pCur = *pHead; pCur && pCur != pShapeEvent; pCur = pCur->next)
-            pPrev = pCur;
-        if (pCur) {
-            if (pPrev)
-                pPrev->next = pShapeEvent->next;
-            else
-                *pHead = pShapeEvent->next;
-        }
-    }
-    free((void *) pShapeEvent);
-    return 1;
-}
-
- /*ARGSUSED*/ static int
-ShapeFreeEvents(void *data, XID id)
-{
-    ShapeEventPtr *pHead, pCur, pNext;
-
-    pHead = (ShapeEventPtr *) data;
-    for (pCur = *pHead; pCur; pCur = pNext) {
-        pNext = pCur->next;
-        FreeResource(pCur->clientResource, ClientType);
-        free((void *) pCur);
-    }
-    free((void *) pHead);
-    return 1;
+  pHead = dixGetPrivate(&pClient->devPrivates, &ShapeClientPrivateKey);
+  for (pShapeEvent = pHead; pShapeEvent;) {
+      if (!pShapeEvent->next)
+          break;
+      if (pShapeEvent->next->client == pClient) {
+          pShapeEventNext = pShapeEvent->next->next;
+          free(pShapeEvent->next);
+          pShapeEvent->next = pShapeEventNext;
+      } else
+          pShapeEvent = pShapeEvent->next;
+  }
+  if (pHead && pHead->client == pClient) {
+      dixSetPrivate(&pClient->devPrivates, &ShapeClientPrivateKey, pHead->next);
+      free(pHead);
+  }
 }
 
 static int
@@ -758,8 +728,7 @@ ProcShapeSelectInput(ClientPtr client)
 {
     REQUEST(xShapeSelectInputReq);
     WindowPtr pWin;
-    ShapeEventPtr pShapeEvent, pNewShapeEvent, *pHead;
-    XID clientResource;
+    ShapeEventPtr pShapeEvent, pNewShapeEvent, pHead;
     int rc;
 
     REQUEST_SIZE_MATCH(xShapeSelectInputReq);
@@ -770,76 +739,30 @@ ProcShapeSelectInput(ClientPtr client)
     rc = dixLookupWindow(&pWin, stuff->window, client, DixReceiveAccess);
     if (rc != Success)
         return rc;
-    rc = dixLookupResourceByType((void **) &pHead, pWin->drawable.id,
-                                 ShapeEventType, client, DixWriteAccess);
-    if (rc != Success && rc != BadValue)
-        return rc;
+
+    pHead = dixGetPrivate(&client->devPrivates, &ShapeClientPrivateKey);
+
+    fprintf(stderr, "SelectInput Head: %p\n", pHead);
 
     switch (stuff->enable) {
     case xTrue:
-        if (pHead) {
-
-            /* check for existing entry. */
-            for (pShapeEvent = *pHead;
-                 pShapeEvent; pShapeEvent = pShapeEvent->next) {
-                if (pShapeEvent->client == client)
-                    return Success;
-            }
+        /* check for existing entry. */
+        for (pShapeEvent = pHead; pShapeEvent; pShapeEvent = pShapeEvent->next) {
+            if (pShapeEvent->client == client)
+                return Success;
         }
 
         /* build the entry */
         pNewShapeEvent = calloc(1, sizeof(ShapeEventRec));
         if (!pNewShapeEvent)
             return BadAlloc;
-        pNewShapeEvent->next = 0;
+        pNewShapeEvent->next = pHead;
         pNewShapeEvent->client = client;
-        pNewShapeEvent->window = pWin;
-        /*
-         * add a resource that will be deleted when
-         * the client goes away
-         */
-        clientResource = FakeClientID(client->index);
-        pNewShapeEvent->clientResource = clientResource;
-        if (!AddResource(clientResource, ClientType, (void *) pNewShapeEvent))
-            return BadAlloc;
-        /*
-         * create a resource to contain a void *to the list
-         * of clients selecting input.  This must be indirect as
-         * the list may be arbitrarily rearranged which cannot be
-         * done through the resource database.
-         */
-        if (!pHead) {
-            pHead = calloc(1, sizeof(ShapeEventPtr));
-            if (!pHead ||
-                !AddResource(pWin->drawable.id, ShapeEventType,
-                             (void *) pHead)) {
-                FreeResource(clientResource, X11_RESTYPE_NONE);
-                return BadAlloc;
-            }
-            *pHead = 0;
-        }
-        pNewShapeEvent->next = *pHead;
-        *pHead = pNewShapeEvent;
+        dixSetPrivate(&client->devPrivates, &ShapeClientPrivateKey, pNewShapeEvent);
         break;
     case xFalse:
         /* delete the interest */
-        if (pHead) {
-            pNewShapeEvent = 0;
-            for (pShapeEvent = *pHead; pShapeEvent;
-                 pShapeEvent = pShapeEvent->next) {
-                if (pShapeEvent->client == client)
-                    break;
-                pNewShapeEvent = pShapeEvent;
-            }
-            if (pShapeEvent) {
-                FreeResource(pShapeEvent->clientResource, ClientType);
-                if (pNewShapeEvent)
-                    pNewShapeEvent->next = pShapeEvent->next;
-                else
-                    *pHead = pShapeEvent->next;
-                free(pShapeEvent);
-            }
-        }
+        ShapeRemoveForClient(client);
         break;
     default:
         client->errorValue = stuff->enable;
@@ -855,16 +778,16 @@ ProcShapeSelectInput(ClientPtr client)
 void
 SendShapeNotify(WindowPtr pWin, int which)
 {
-    ShapeEventPtr *pHead, pShapeEvent;
+    ShapeEventPtr pHead, pShapeEvent;
     BoxRec extents;
     RegionPtr region;
     BYTE shaped;
-    int rc;
 
-    rc = dixLookupResourceByType((void **) &pHead, pWin->drawable.id,
-                                 ShapeEventType, serverClient, DixReadAccess);
-    if (rc != Success)
+    ClientPtr pClient = dixClientForXID(pWin->drawable.id);
+    pHead = dixGetPrivate(&pClient->devPrivates, &ShapeClientPrivateKey);
+    if (!pHead)
         return;
+
     switch (which) {
     case ShapeBounding:
         region = wBoundingShape(pWin);
@@ -912,7 +835,7 @@ SendShapeNotify(WindowPtr pWin, int which)
         return;
     }
     UpdateCurrentTimeIf();
-    for (pShapeEvent = *pHead; pShapeEvent; pShapeEvent = pShapeEvent->next) {
+    for (pShapeEvent = pHead; pShapeEvent; pShapeEvent = pShapeEvent->next) {
         xShapeNotifyEvent se = {
             .type = ShapeNotify + ShapeEventBase,
             .kind = which,
@@ -932,29 +855,23 @@ static int
 ProcShapeInputSelected(ClientPtr client)
 {
     REQUEST(xShapeInputSelectedReq);
-    WindowPtr pWin;
-    ShapeEventPtr pShapeEvent, *pHead;
-    int enabled, rc;
+    ShapeEventPtr pShapeEvent, pHead;
+    int enabled;
 
     REQUEST_SIZE_MATCH(xShapeInputSelectedReq);
 
     if (client->swapped)
         swapl(&stuff->window);
 
-    rc = dixLookupWindow(&pWin, stuff->window, client, DixGetAttrAccess);
-    if (rc != Success)
-        return rc;
-    rc = dixLookupResourceByType((void **) &pHead, pWin->drawable.id,
-                                 ShapeEventType, client, DixReadAccess);
-    if (rc != Success && rc != BadValue)
-        return rc;
+    pHead = dixGetPrivate(&client->devPrivates, &ShapeClientPrivateKey);
+    if (!pHead)
+        return BadMatch;
+
     enabled = xFalse;
-    if (pHead) {
-        for (pShapeEvent = *pHead; pShapeEvent; pShapeEvent = pShapeEvent->next) {
-            if (pShapeEvent->client == client) {
-                enabled = xTrue;
-                break;
-            }
+    for (pShapeEvent = pHead; pShapeEvent; pShapeEvent = pShapeEvent->next) {
+        if (pShapeEvent->client == client) {
+            enabled = xTrue;
+            break;
         }
     }
 
@@ -1097,12 +1014,15 @@ ShapeExtensionInit(void)
 {
     ExtensionEntry *extEntry;
 
-    ClientType = CreateNewResourceType(ShapeFreeClient, "ShapeClient");
-    ShapeEventType = CreateNewResourceType(ShapeFreeEvents, "ShapeEvent");
-    if (ClientType && ShapeEventType &&
-        (extEntry = AddExtension(SHAPENAME, ShapeNumberEvents, 0,
-                                 ProcShapeDispatch, ProcShapeDispatch,
-                                 NULL, StandardMinorOpcode))) {
+    if (!dixRegisterPrivateKey(&ShapeClientPrivateKey, PRIVATE_CLIENT, 0))
+        return;
+
+    dixClientHookClientFree(ShapeRemoveForClient);
+
+    extEntry = AddExtension(SHAPENAME, ShapeNumberEvents, 0,
+                            ProcShapeDispatch, ProcShapeDispatch,
+                            NULL, StandardMinorOpcode);
+    if (extEntry) {
         ShapeEventBase = extEntry->eventBase;
         EventSwapVector[ShapeEventBase] = (EventSwapPtr) SShapeNotifyEvent;
     }

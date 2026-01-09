@@ -33,6 +33,14 @@
 /* resource field */
 #define RESOURCE_ID_MASK        ((1u << CLIENTOFFSET) - 1)
 
+
+typedef void (*XorgClientFreeProcPtr)(ClientPtr pClient);
+
+/*
+ * @brief called when client is freed
+ */
+void dixClientHookClientFree(XorgClientFreeProcPtr pFunc);
+
 /*
  * @brief retrieve client that owns given window
  *

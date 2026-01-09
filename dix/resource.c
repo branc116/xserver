@@ -1115,6 +1115,16 @@ FreeClientNeverRetainResources(ClientPtr client)
     }
 }
 
+XorgClientFreeProcPtr pDixClientFreeHook;
+static void dixClientHookClientFreeCall(ClientPtr pClient) {
+  if (pDixClientFreeHook) pDixClientFreeHook(pClient);
+}
+
+void dixClientHookClientFree(XorgClientFreeProcPtr pFunc) {
+  assert(!pDixClientFreeHook && "TODO: Multiple hooks");
+  pDixClientFreeHook = pFunc;
+}
+
 void
 FreeClientResources(ClientPtr client)
 {
@@ -1157,7 +1167,9 @@ FreeClientResources(ClientPtr client)
     free(clientTable[client->index].resources);
     clientTable[client->index].resources = NULL;
     clientTable[client->index].buckets = 0;
+    dixClientHookClientFreeCall(client);
 }
+
 
 void
 FreeAllResources(void)
